@@ -28,10 +28,53 @@
 #include "../common/hex.h"
 #include "../common/jansson_import.h"
 
+typedef int (*handle_json_request_type)(const char*);
+
+static ngx_str_t json_handle_library;
+static handle_json_request_type handle_json_request_fun = NULL;
 
 static ngx_int_t initialize(ngx_cycle_t* cycle) {
-    int err = jansson_initialize();
-    return 0 == err ? NGX_OK : NGX_ERROR;
+    // load jansson
+    int err_jansson = jansson_initialize();
+    if (0 != err_jansson) {
+        ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "cannot initialize 'jansson' library");
+        return NGX_ERROR;
+    }
+
+    // load handler shared lib
+    if (0 == json_handle_library.len) {
+        ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "handler shared library not specified");
+        return NGX_ERROR;
+    }
+
+    // need nul-terminated string here,
+    // lets be consistent with string handling elsewhere
+    json_t* libname_json = json_stringn((const char*) json_handle_library.data, json_handle_library.len);
+    if (NULL == libname_json){
+        ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "invalid shared library name specified");
+        return NGX_ERROR;
+    }
+
+    // load lib
+    const char* libname = json_string_value(libname_json);
+    void* lib = dyload_library(libname);
+    if (NULL == lib) {
+        ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "cannot load shared library, name: [%s]", libname);
+        json_decref(libname_json);
+        return NGX_ERROR;
+    }
+
+    // lookup symbol
+    handle_json_request_fun = dyload_symbol(lib, "handle_json_request");
+    if (NULL == handle_json_request_fun) {
+        ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
+                "cannot find symbol 'handle_json_request' in shared library, name: [%s]", libname);
+        json_decref(libname_json);
+        return NGX_ERROR;
+    }
+    json_decref(libname_json);
+
+    return NGX_OK;
 }
 
 static json_t* read_headers(ngx_http_headers_in_t* headers_in) {
@@ -136,8 +179,14 @@ static void body_handler(ngx_http_request_t* r) {
 
     char* dumped = json_dumps(req, JSON_INDENT(4));
     json_decref(req);
-    fprintf(stderr, "%s\n", dumped);
+    int err_handle = handle_json_request_fun(dumped);
     free(dumped);
+    if (0 != err_handle) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                "'handle_json_request' call returned error, code: [%d]", err_handle);
+        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
 
     r->main->count++;
 }
@@ -166,6 +215,18 @@ static char* conf_json_handler(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
     return NGX_CONF_OK;
 }
 
+static char* conf_json_handler_library(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
+    if (2 != cf->args->nelts) {
+        ngx_conf_log_error(NGX_LOG_ERR, cf, 0,
+                "conf_json_handler_library: invalid configuration parameter,"
+                " single shared library name must be specified");
+        return NGX_CONF_ERROR;
+    }
+    ngx_str_t* elts = cf->args->elts;
+    json_handle_library = elts[1];
+    return NGX_CONF_OK;
+}
+
 static ngx_command_t conf_desc[] = {
 
     { ngx_string("json_handler"), /* directive */
@@ -173,6 +234,13 @@ static ngx_command_t conf_desc[] = {
       conf_json_handler, /* configuration setup function */
       NGX_HTTP_LOC_CONF_OFFSET, /* No offset. Only one context is supported. */
       0, /* No offset when storing the module configuration on struct. */
+      NULL},
+
+    { ngx_string("json_handler_library"),
+      NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+      conf_json_handler_library,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
       NULL},
 
     ngx_null_command /* command termination */

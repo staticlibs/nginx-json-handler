@@ -30,21 +30,76 @@
 
 
 static ngx_int_t initialize(ngx_cycle_t* cycle) {
-    int err = jansson_initialize();
-    return 0 == err ? NGX_OK : NGX_ERROR;
+    // load jansson
+    int err_jansson = jansson_initialize();
+    if (0 != err_jansson) {
+        ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "cannot initialize 'jansson' library");
+        return NGX_ERROR;
+    }
+    return NGX_OK;
+}
+
+static void body_handler(ngx_http_request_t* r) {
+
+    if (r->request_body == NULL) {
+        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+    // todo
+
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "incoming response");
+
+    ngx_int_t status = NGX_HTTP_OK;
+
+    // client response
+    /*
+    ngx_http_request_t* cr = find_gateway_request(&r->headers_in);
+    if (NULL != cr) {
+        status = send_client_response(cr, r);
+    } else {
+        status = NGX_HTTP_BAD_REQUEST;
+    }
+    */
+
+    // own response
+
+    /* Allocate a new buffer for sending out the reply. */
+    ngx_buf_t* b = ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
+
+    /* Insertion in the buffer chain. */
+    ngx_chain_t out;
+    out.buf = b;
+    out.next = NULL; /* just one buffer */
+
+    b->pos = 0; /* first position in memory of the data */
+    b->last = 0; /* last position in memory of the data */
+    b->last_buf = 1; /* there will be no more buffers in the request */
+
+    /* Sending the headers for the reply. */
+    r->headers_out.status = status; /* 200 status code */
+    /* Get the content length of the body. */
+    r->headers_out.content_length_n = 0;
+    ngx_http_send_header(r); /* Send the headers */
+
+    /* Send the body, and return the status code of the output filter chain. */
+    ngx_http_output_filter(r, &out);
 }
 
 static ngx_int_t request_handler(ngx_http_request_t *r) {
 
-    json_t* obj = json_object();
-    json_decref(obj);
+    // http://mailman.nginx.org/pipermail/nginx/2007-August/001559.html
+    r->request_body_in_single_buf = 1;
+    r->request_body_in_persistent_file = 1;
+    r->request_body_in_clean_file = 1;
+    r->request_body_file_log_level = 0;
 
-    // todo: body
-    ngx_http_discard_request_body(r);
+    ngx_int_t rc = ngx_http_read_client_request_body(r, body_handler);
 
-    r->main->count++;
+    if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
+        return rc;
+    }
+
     return NGX_DONE;
-
 }
 
 static char* conf_json_handler_response(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
