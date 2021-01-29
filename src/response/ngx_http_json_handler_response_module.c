@@ -22,21 +22,84 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <jansson.h>
+static u_char ngx_wilton[] = "gateway async resp 3\n";
 
-#include "../common/dyload.h"
-#include "../common/hex.h"
-#include "../common/jansson_import.h"
+static ngx_http_request_t* find_request_handle(ngx_http_request_t* r) {
+    ngx_list_part_t* part = &r->headers_in.headers.part;
+    ngx_table_elt_t* elts = part->elts;
 
+    for (size_t i = 0; /* void */; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            elts = part->elts;
+            i = 0;
+        }
 
-static ngx_int_t initialize(ngx_cycle_t* cycle) {
-    // load jansson
-    int err_jansson = jansson_initialize();
-    if (0 != err_jansson) {
-        ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "cannot initialize 'jansson' library");
-        return NGX_ERROR;
+        if (0 == strncmp("x-nginx-request-handle", (const char*) elts[i].lowcase_key, elts[i].key.len)) {
+            if (elts[i].value.len >= 32) {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "Invalid handle received");
+                return NULL;
+            }
+            char cstr[32];
+            memset(cstr, '\0', sizeof(cstr));
+            memcpy(cstr, (const char*) elts[i].value.data, elts[i].value.len);
+            char* endptr;
+            errno = 0;
+            long long handle = strtoll(cstr, &endptr, 0);
+            if (errno == ERANGE || cstr + elts[i].value.len != endptr) {
+                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                        "Cannot parse handle from string, value: [%s]\n", cstr);
+                return NULL;
+            }
+            return (ngx_http_request_t*) handle;
+        }
     }
-    return NGX_OK;
+    return NULL;
+}
+
+static ngx_int_t send_client_response(ngx_http_request_t* r, ngx_http_request_t* gr) {
+
+    if (r->connection->error) {
+        ngx_log_error(NGX_LOG_DEBUG, ngx_cycle->log, 0, "Request already finalized %d", r->count);
+        ngx_http_finalize_request(r, NGX_ERROR);
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    /* Set the Content-Type header. */
+    //gr->headers_out.content_type.len = r->headers_in.content_type->value.len;
+    //gr->headers_out.content_type.data = r->headers_in.content_type->value.data;
+
+    // todo: body
+    ngx_http_discard_request_body(gr);
+
+    /* Allocate a new buffer for sending out the reply. */
+    ngx_buf_t* b = ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
+
+    ngx_chain_t out;
+    /* Insertion in the buffer chain. */
+    out.buf = b;
+    out.next = NULL; /* just one buffer */
+
+    b->pos = ngx_wilton; /* first position in memory of the data */
+    b->last = ngx_wilton + sizeof(ngx_wilton) - 1; /* last position in memory of the data */
+    b->memory = 1; /* content is in read-only memory */
+    b->last_buf = 1; /* there will be no more buffers in the request */
+
+    /* Sending the headers for the reply. */
+    r->headers_out.status = NGX_HTTP_OK; /* 200 status code */
+    /* Get the content length of the body. */
+    r->headers_out.content_length_n = sizeof(ngx_wilton) - 1;
+    ngx_http_send_header(r); /* Send the headers */
+
+    /* Send the body, and return the status code of the output filter chain. */
+    ngx_http_output_filter(r, &out);
+    ngx_http_finalize_request(r, NGX_HTTP_OK);
+    ngx_http_finalize_request(r, NGX_HTTP_OK);
+    ngx_http_run_posted_requests(r->connection);
+
+    return NGX_HTTP_OK;
 }
 
 static void body_handler(ngx_http_request_t* r) {
@@ -52,14 +115,12 @@ static void body_handler(ngx_http_request_t* r) {
     ngx_int_t status = NGX_HTTP_OK;
 
     // client response
-    /*
-    ngx_http_request_t* cr = find_gateway_request(&r->headers_in);
+    ngx_http_request_t* cr = find_request_handle(r);
     if (NULL != cr) {
         status = send_client_response(cr, r);
     } else {
         status = NGX_HTTP_BAD_REQUEST;
     }
-    */
 
     // own response
 
@@ -83,6 +144,8 @@ static void body_handler(ngx_http_request_t* r) {
 
     /* Send the body, and return the status code of the output filter chain. */
     ngx_http_output_filter(r, &out);
+
+    ngx_http_finalize_request(r, NGX_HTTP_OK);
 }
 
 static ngx_int_t request_handler(ngx_http_request_t *r) {
@@ -142,7 +205,7 @@ ngx_module_t ngx_http_json_handler_response_module = {
     NGX_HTTP_MODULE, /* module type */
     NULL, /* init master */
     NULL, /* init module */
-    initialize, /* init process */
+    NULL, /* init process */
     NULL, /* init thread */
     NULL, /* exit thread */
     NULL, /* exit process */

@@ -24,14 +24,14 @@
 
 #include <jansson.h>
 
-#include "../common/dyload.h"
-#include "../common/hex.h"
-#include "../common/jansson_import.h"
+#include "dyload.h"
+#include "hex.h"
+#include "jansson_import.h"
 
-typedef int (*handle_json_request_type)(const char*);
+typedef int (*submit_json_request_type)(const char*);
 
 static ngx_str_t json_handle_library;
-static handle_json_request_type handle_json_request_fun = NULL;
+static submit_json_request_type submit_json_request_fun = NULL;
 
 static ngx_int_t initialize(ngx_cycle_t* cycle) {
     // load jansson
@@ -65,10 +65,10 @@ static ngx_int_t initialize(ngx_cycle_t* cycle) {
     }
 
     // lookup symbol
-    handle_json_request_fun = dyload_symbol(lib, "handle_json_request");
-    if (NULL == handle_json_request_fun) {
+    submit_json_request_fun = dyload_symbol(lib, "submit_json_request");
+    if (NULL == submit_json_request_fun) {
         ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
-                "cannot find symbol 'handle_json_request' in shared library, name: [%s]", libname);
+                "cannot find symbol 'submit_json_request' in shared library, name: [%s]", libname);
         json_decref(libname_json);
         return NGX_ERROR;
     }
@@ -122,6 +122,10 @@ static void json_set_ngx_string(json_t* obj, const char* key, ngx_str_t str) {
 
 static json_t* read_meta(ngx_http_request_t* r) {
     json_t* res = json_object();
+    json_t* handle = json_integer((long long) r);
+    if (NULL != handle) {
+        json_object_set_new(res, "requestHandle", handle);
+    }
     json_set_ngx_string(res, "uri", r->uri);
     json_set_ngx_string(res, "args", r->args);
     json_set_ngx_string(res, "unparsedUri", r->unparsed_uri);
@@ -139,13 +143,21 @@ static json_t* read_data(ngx_http_request_t* r) {
         if (NULL != in) {
             ngx_buf_t* buf = in->buf;
             size_t plain_len = buf->last - buf->pos;
-            char* data_hex = hex_encode(buf->pos, plain_len);
-            json_t* data_hex_json = json_stringn(data_hex, plain_len * 2);
-            json_object_set_new(res, "hex", data_hex_json);
-            free(data_hex);
+            json_t* plain_json = json_stringn((const char*) buf->pos, plain_len);
+            if (NULL != plain_json) {
+                json_object_set_new(res, "utf8", plain_json);
+                json_object_set_new(res, "hex", json_null());
+            } else {
+                char* data_hex = hex_encode(buf->pos, plain_len);
+                json_t* data_hex_json = json_stringn(data_hex, plain_len * 2);
+                json_object_set_new(res, "utf8", json_null());
+                json_object_set_new(res, "hex", data_hex_json);
+                free(data_hex);
+            }
         } else {
             json_t* empty_json = json_stringn("", 0);
-            json_object_set_new(res, "hex", empty_json);
+            json_object_set_new(res, "utf8", empty_json);
+            json_object_set_new(res, "hex", json_null());
         }
     } else {
         json_object_set_new(res, "hex", json_null());
@@ -179,11 +191,11 @@ static void body_handler(ngx_http_request_t* r) {
 
     char* dumped = json_dumps(req, JSON_INDENT(4));
     json_decref(req);
-    int err_handle = handle_json_request_fun(dumped);
+    int err_handle = submit_json_request_fun(dumped);
     free(dumped);
     if (0 != err_handle) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                "'handle_json_request' call returned error, code: [%d]", err_handle);
+                "'submit_json_request' call returned error, code: [%d]", err_handle);
         ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
     }

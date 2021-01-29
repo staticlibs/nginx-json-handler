@@ -28,7 +28,7 @@
 extern "C" {
 #endif
 
-int handle_json_request(const char* req_json);
+int submit_json_request(const char* req_json);
 
 #ifdef __cplusplus
 }

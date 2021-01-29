@@ -24,7 +24,6 @@
 #ifndef JSON_HANDLER_HEX_H
 #define JSON_HANDLER_HEX_H
 
-
 static const char* hex_symbols = "0123456789abcdef";
 
 static char* hex_encode(const unsigned char* plain, size_t plain_len) {
@@ -37,13 +36,6 @@ static char* hex_encode(const unsigned char* plain, size_t plain_len) {
     }
     return hex;
 }
-
-/*
-static char* hex_decode(const char* hex) {
-    (void) hex;
-    return NULL;
-}
- */
 
 #endif /* JSON_HANDLER_HEX_H */
 
