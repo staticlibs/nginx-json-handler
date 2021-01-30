@@ -38,6 +38,12 @@ json_t* json_integer(json_int_t value) {
     return json_integer_fun(value);
 }
 
+typedef json_t* (*json_string_type)(const char *);
+static json_string_type json_string_fun = NULL;
+json_t* json_string(const char *value) {
+    return json_string_fun(value);
+}
+
 typedef json_t* (*json_stringn_type)(const char *, size_t);
 static json_stringn_type json_stringn_fun = NULL;
 json_t* json_stringn(const char *value, size_t len) {
@@ -68,6 +74,13 @@ int json_object_set_new(json_t* object, const char* key, json_t* value) {
 
 // serialization
 
+typedef json_t* (*json_loadb_type)(const char*, size_t, size_t, json_error_t*);
+static json_loadb_type json_loadb_fun = NULL;
+
+json_t *json_loadb(const char *buffer, size_t buflen, size_t flags, json_error_t *error) {
+    return json_loadb_fun(buffer, buflen, flags, error);
+}
+
 typedef char* (*json_dumps_type)(const json_t*, size_t);
 static json_dumps_type json_dumps_fun = NULL;
 char *json_dumps(const json_t* json, size_t flags) {
@@ -90,6 +103,8 @@ static int jansson_initialize() {
     if (NULL == json_null_fun) return -1;
     json_integer_fun = dyload_symbol(lib, "json_integer");
     if (NULL == json_integer_fun) return -1;
+    json_string_fun = dyload_symbol(lib, "json_string");
+    if (NULL == json_string_fun) return -1;
     json_stringn_fun = dyload_symbol(lib, "json_stringn");
     if (NULL == json_stringn_fun) return -1;
     json_object_fun = dyload_symbol(lib, "json_object");
@@ -101,6 +116,8 @@ static int jansson_initialize() {
     json_object_set_new_fun = dyload_symbol(lib, "json_object_set_new");
     if (NULL == json_object_set_new_fun) return -1;
 
+    json_loadb_fun = dyload_symbol(lib, "json_loadb");
+    if (NULL == json_loadb_fun) return -1;
     json_dumps_fun = dyload_symbol(lib, "json_dumps");
     if (NULL == json_dumps_fun) return -1;
 

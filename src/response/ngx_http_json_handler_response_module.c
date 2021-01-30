@@ -22,7 +22,33 @@
 #include <stdlib.h>
 #include <string.h>
 
-static u_char ngx_wilton[] = "gateway async resp 3\n";
+#define RESPONSE_HEADER_PREFIX "x-response-"
+
+static ngx_int_t send_buffer(ngx_http_request_t* r, ngx_buf_t* buf) {
+    // send headers
+    ngx_int_t err_headers = ngx_http_send_header(r);
+    if (NGX_OK != err_headers) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "Error sending headers");
+        ngx_http_finalize_request(r, NGX_ERROR);
+        return err_headers;
+    }
+
+    // send data
+    ngx_chain_t chain;
+    chain.buf = buf;
+    chain.next = NULL;
+    ngx_int_t err_filters = ngx_http_output_filter(r, &chain);
+    if (NGX_OK != err_filters) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "Error sending data");
+        ngx_http_finalize_request(r, NGX_ERROR);
+        return err_filters;
+    }
+
+    // release request
+    ngx_http_finalize_request(r, NGX_HTTP_OK);
+
+    return NGX_OK;
+}
 
 static ngx_http_request_t* find_request_handle(ngx_http_request_t* r) {
     ngx_list_part_t* part = &r->headers_in.headers.part;
@@ -38,20 +64,22 @@ static ngx_http_request_t* find_request_handle(ngx_http_request_t* r) {
             i = 0;
         }
 
-        if (0 == strncmp("x-nginx-request-handle", (const char*) elts[i].lowcase_key, elts[i].key.len)) {
-            if (elts[i].value.len >= 32) {
+        ngx_table_elt_t* h = &elts[i];
+
+        if (0 == strncmp("x-nginx-request-handle", (const char*) h->lowcase_key, h->key.len)) {
+            if (h->value.len >= 32) {
                 ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "Invalid handle received");
                 return NULL;
             }
             char cstr[32];
             memset(cstr, '\0', sizeof(cstr));
-            memcpy(cstr, (const char*) elts[i].value.data, elts[i].value.len);
+            memcpy(cstr, (const char*) h->value.data, h->value.len);
             char* endptr;
             errno = 0;
             long long handle = strtoll(cstr, &endptr, 0);
-            if (errno == ERANGE || cstr + elts[i].value.len != endptr) {
+            if (errno == ERANGE || cstr + h->value.len != endptr) {
                 ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                        "Cannot parse handle from string, value: [%s]\n", cstr);
+                        "Cannot parse handle from string, value: [%s]", cstr);
                 return NULL;
             }
             return (ngx_http_request_t*) handle;
@@ -60,46 +88,143 @@ static ngx_http_request_t* find_request_handle(ngx_http_request_t* r) {
     return NULL;
 }
 
-static ngx_int_t send_client_response(ngx_http_request_t* r, ngx_http_request_t* gr) {
+static ngx_int_t copy_single_header(ngx_http_request_t* r, ngx_table_elt_t* hin, size_t prefix_len) {
+
+    // copy key
+    ngx_str_t key;
+    key.len = hin->key.len - prefix_len;
+    key.data = ngx_pcalloc(r->pool, key.len);
+    if (NULL == key.data) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                "Pool allocation error, size: [%l]", key.len);
+        return NGX_ERROR;
+    }
+    memcpy(key.data, hin->key.data + prefix_len, key.len);
+
+    // copy value
+    ngx_str_t value;
+    value.len = hin->value.len;
+    value.data = ngx_pcalloc(r->pool, value.len);
+    if (NULL == value.data) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                "Pool allocation error, size: [%l]", value.len);
+        return NGX_ERROR;
+    }
+    memcpy(value.data, hin->value.data, value.len);
+
+    // set header
+    ngx_table_elt_t* hout = ngx_list_push(&r->headers_out.headers);
+    if (hout == NULL) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "Header allocation error");
+        return NGX_ERROR;
+    }
+    hout->key = key;
+    hout->value = value;
+    hout->hash = 1;
+
+    return NGX_OK;
+}
+
+static ngx_int_t copy_headers(ngx_http_request_t* r, ngx_http_request_t* hr) {
+    ngx_list_part_t* part = &hr->headers_in.headers.part;
+    ngx_table_elt_t* elts = part->elts;
+
+    for (size_t i = 0; /* void */; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            elts = part->elts;
+            i = 0;
+        }
+
+        ngx_table_elt_t* hin = &elts[i];
+
+        size_t len = sizeof(RESPONSE_HEADER_PREFIX) - 1;
+        if (hin->key.len > len &&
+                0 == strncmp(RESPONSE_HEADER_PREFIX, (const char*) hin->lowcase_key, len)) {
+            ngx_int_t err_copy = copy_single_header(r, hin, len);
+            if (NGX_OK != err_copy) {
+                return err_copy;
+            }
+        }
+    }
+
+    return NGX_OK;
+}
+
+static ngx_buf_t* copy_body(ngx_http_request_t* r, ngx_http_request_t* hr) {
+    ngx_buf_t* buf = ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
+    if (NULL == buf) {
+        ngx_log_error(NGX_LOG_DEBUG, ngx_cycle->log, 0, "Error allocating buffer struct");
+        return NULL;
+    }
+    buf->last_buf = 1;
+
+    if (NULL == hr->request_body->temp_file) {
+        ngx_chain_t* in = hr->request_body->bufs;
+        if (NULL != in) {
+            size_t len = in->buf->last - in->buf->pos;
+            buf->pos = ngx_pcalloc(r->pool, len);
+            if (NULL == buf->pos) {
+                ngx_log_error(NGX_LOG_DEBUG, ngx_cycle->log, 0,
+                        "Error allocating buffer, size: [%l]", len);
+                return NULL;
+            }
+            memcpy(buf->pos, in->buf->pos, len);
+            buf->last = buf->pos + len;
+            buf->start = buf->pos;
+            buf->end = buf-> last;
+            buf->memory = 1;
+        } else { // empty body
+            // no-op
+        }
+    } else { // file
+        // todo
+    }
+    return buf;
+}
+
+static ngx_int_t send_client_response(ngx_http_request_t* r, ngx_http_request_t* hr) {
 
     if (r->connection->error) {
-        ngx_log_error(NGX_LOG_DEBUG, ngx_cycle->log, 0, "Request already finalized %d", r->count);
+        ngx_log_error(NGX_LOG_DEBUG, ngx_cycle->log, 0,
+                "Request already finalized, counter: [%d]", r->count);
         ngx_http_finalize_request(r, NGX_ERROR);
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
-    /* Set the Content-Type header. */
-    //gr->headers_out.content_type.len = r->headers_in.content_type->value.len;
-    //gr->headers_out.content_type.data = r->headers_in.content_type->value.data;
 
-    // todo: body
-    ngx_http_discard_request_body(gr);
+    // headers
+    ngx_int_t err_headers = copy_headers(r, hr);
+    if (NGX_OK != err_headers) {
+        ngx_http_finalize_request(r, NGX_ERROR);
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
 
-    /* Allocate a new buffer for sending out the reply. */
-    ngx_buf_t* b = ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
+    // body
+    if (NULL == hr->request_body) {
+        ngx_log_error(NGX_LOG_DEBUG, ngx_cycle->log, 0, "Request body access error");
+        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    ngx_buf_t* buf = copy_body(r, hr);
+    if (NULL == buf) {
+        ngx_http_finalize_request(r, NGX_ERROR);
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
 
-    ngx_chain_t out;
-    /* Insertion in the buffer chain. */
-    out.buf = b;
-    out.next = NULL; /* just one buffer */
+    // send
+    r->headers_out.status = NGX_HTTP_OK;
+    r->headers_out.content_length_n = buf->last - buf->pos;
 
-    b->pos = ngx_wilton; /* first position in memory of the data */
-    b->last = ngx_wilton + sizeof(ngx_wilton) - 1; /* last position in memory of the data */
-    b->memory = 1; /* content is in read-only memory */
-    b->last_buf = 1; /* there will be no more buffers in the request */
-
-    /* Sending the headers for the reply. */
-    r->headers_out.status = NGX_HTTP_OK; /* 200 status code */
-    /* Get the content length of the body. */
-    r->headers_out.content_length_n = sizeof(ngx_wilton) - 1;
-    ngx_http_send_header(r); /* Send the headers */
-
-    /* Send the body, and return the status code of the output filter chain. */
-    ngx_http_output_filter(r, &out);
-    ngx_http_finalize_request(r, NGX_HTTP_OK);
-    ngx_http_finalize_request(r, NGX_HTTP_OK);
-    ngx_http_run_posted_requests(r->connection);
-
-    return NGX_HTTP_OK;
+    ngx_int_t err_send = send_buffer(r, buf);
+    if (NGX_OK == err_send) {
+        ngx_http_run_posted_requests(r->connection);
+        return NGX_HTTP_OK;
+    } else {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
 }
 
 static void body_handler(ngx_http_request_t* r) {
@@ -108,9 +233,6 @@ static void body_handler(ngx_http_request_t* r) {
         ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
     }
-    // todo
-
-    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "incoming response");
 
     ngx_int_t status = NGX_HTTP_OK;
 
@@ -123,29 +245,15 @@ static void body_handler(ngx_http_request_t* r) {
     }
 
     // own response
+    ngx_buf_t* buf = ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
+    buf->pos = 0;
+    buf->last = 0;
+    buf->last_buf = 1;
 
-    /* Allocate a new buffer for sending out the reply. */
-    ngx_buf_t* b = ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
-
-    /* Insertion in the buffer chain. */
-    ngx_chain_t out;
-    out.buf = b;
-    out.next = NULL; /* just one buffer */
-
-    b->pos = 0; /* first position in memory of the data */
-    b->last = 0; /* last position in memory of the data */
-    b->last_buf = 1; /* there will be no more buffers in the request */
-
-    /* Sending the headers for the reply. */
-    r->headers_out.status = status; /* 200 status code */
-    /* Get the content length of the body. */
+    r->headers_out.status = status;
     r->headers_out.content_length_n = 0;
-    ngx_http_send_header(r); /* Send the headers */
 
-    /* Send the body, and return the status code of the output filter chain. */
-    ngx_http_output_filter(r, &out);
-
-    ngx_http_finalize_request(r, NGX_HTTP_OK);
+    send_buffer(r, buf);
 }
 
 static ngx_int_t request_handler(ngx_http_request_t *r) {

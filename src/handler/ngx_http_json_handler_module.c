@@ -28,6 +28,11 @@
 #include "hex.h"
 #include "jansson_import.h"
 
+#define FORMAT_JSON "json"
+#define FORMAT_STRING "string"
+#define FORMAT_HEX "stringHex"
+#define FORMAT_FILE "file"
+
 typedef int (*submit_json_request_type)(const char*);
 
 static ngx_str_t json_handle_library;
@@ -123,7 +128,7 @@ static void json_set_ngx_string(json_t* obj, const char* key, ngx_str_t str) {
 static json_t* read_meta(ngx_http_request_t* r) {
     json_t* res = json_object();
     json_t* handle = json_integer((long long) r);
-    if (NULL != handle) {
+    if (NULL != handle) { // cannot happen
         json_object_set_new(res, "requestHandle", handle);
     }
     json_set_ngx_string(res, "uri", r->uri);
@@ -138,36 +143,58 @@ static json_t* read_data(ngx_http_request_t* r) {
     json_t* res = json_object();
 
     if (NULL == r->request_body->temp_file) {
-        json_object_set_new(res, "file", json_null());
         ngx_chain_t* in = r->request_body->bufs;
-        if (NULL != in) {
+        if (NULL != in && NULL != in->buf) {
             ngx_buf_t* buf = in->buf;
-            size_t plain_len = buf->last - buf->pos;
-            json_t* plain_json = json_stringn((const char*) buf->pos, plain_len);
-            if (NULL != plain_json) {
-                json_object_set_new(res, "utf8", plain_json);
-                json_object_set_new(res, "hex", json_null());
+            size_t buf_len = buf->last - buf->pos;
+            json_t* json = json_loadb((const char*) buf->pos, buf_len, JSON_REJECT_DUPLICATES, NULL);
+            if (NULL != json) { // got valid json
+                json_object_set_new(res, "format", json_string(FORMAT_JSON));
+                json_object_set_new(res, FORMAT_JSON, json);
+                json_object_set_new(res, FORMAT_STRING, json_null());
+                json_object_set_new(res, FORMAT_HEX, json_null());
+                json_object_set_new(res, FORMAT_FILE, json_null());
             } else {
-                char* data_hex = hex_encode(buf->pos, plain_len);
-                json_t* data_hex_json = json_stringn(data_hex, plain_len * 2);
-                json_object_set_new(res, "utf8", json_null());
-                json_object_set_new(res, "hex", data_hex_json);
-                free(data_hex);
+                json_t* utf8 = json_stringn((const char*) buf->pos, buf_len);
+                if (NULL != utf8) { // got valid utf8 string
+                    json_object_set_new(res, "format", json_string(FORMAT_STRING));
+                    json_object_set_new(res, FORMAT_JSON, json_null());
+                    json_object_set_new(res, FORMAT_STRING, utf8);
+                    json_object_set_new(res, FORMAT_HEX, json_null());
+                    json_object_set_new(res, FORMAT_FILE, json_null());
+                } else { // got non-utf8 data
+                    char* data_hex = hex_encode(buf->pos, buf_len);
+                    json_t* hex = json_stringn(data_hex, buf_len * 2);
+                    free(data_hex);
+                    json_object_set_new(res, "format", json_string(FORMAT_HEX));
+                    json_object_set_new(res, FORMAT_JSON, json_null());
+                    json_object_set_new(res, FORMAT_STRING, json_null());
+                    if (NULL != hex) {
+                        json_object_set_new(res, FORMAT_HEX, hex);
+                    } else {
+                        json_object_set_new(res, FORMAT_HEX, json_string(""));
+                    }
+                    json_object_set_new(res, FORMAT_FILE, json_null());
+                }
             }
-        } else {
-            json_t* empty_json = json_stringn("", 0);
-            json_object_set_new(res, "utf8", empty_json);
-            json_object_set_new(res, "hex", json_null());
+        } else { // empty input
+            json_object_set_new(res, "format", json_string(FORMAT_STRING));
+            json_object_set_new(res, FORMAT_JSON, json_null());
+            json_object_set_new(res, FORMAT_STRING, json_string(""));
+            json_object_set_new(res, FORMAT_HEX, json_null());
+            json_object_set_new(res, FORMAT_FILE, json_null());
         }
-    } else {
-        json_object_set_new(res, "hex", json_null());
+    } else { // got a file
         ngx_str_t path = r->request_body->temp_file->file.name;
         json_t* path_json = json_stringn((const char*) path.data, path.len);
+        json_object_set_new(res, "format", json_string(FORMAT_FILE));
+        json_object_set_new(res, FORMAT_JSON, json_null());
+        json_object_set_new(res, FORMAT_STRING, json_null());
+        json_object_set_new(res, FORMAT_HEX, json_null());
         if (NULL != path_json) {
-            json_object_set_new(res, "file", path_json);
+            json_object_set_new(res, FORMAT_FILE, path_json);
         } else {
-            json_t* empty_json = json_stringn("", 0);
-            json_object_set_new(res, "file", empty_json);
+            json_object_set_new(res, FORMAT_FILE, json_string(""));
         }
     }
 
@@ -176,7 +203,7 @@ static json_t* read_data(ngx_http_request_t* r) {
 
 static void body_handler(ngx_http_request_t* r) {
 
-    if (r->request_body == NULL) {
+    if (NULL == r->request_body) {
         ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
     }
@@ -199,8 +226,6 @@ static void body_handler(ngx_http_request_t* r) {
         ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
     }
-
-    r->main->count++;
 }
 
 static ngx_int_t request_handler(ngx_http_request_t *r) {
